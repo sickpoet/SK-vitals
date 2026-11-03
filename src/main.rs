@@ -7,7 +7,7 @@ use std::mem::{size_of, zeroed};
 use std::ptr::null;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
+use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::UI::HiDpi::*;
@@ -16,7 +16,7 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use stats::{Sampler, Snapshot};
-use ui::{wide, Fonts};
+use ui::{wide, Renderer};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SHOW_PANEL: u32 = WM_APP + 2;
@@ -34,7 +34,7 @@ const AUTOSTART_VALUE: &str = "SK-vitals";
 struct App {
     hwnd: HWND,
     icon: HICON,
-    fonts: Fonts,
+    renderer: Renderer,
     sampler: Sampler,
     snapshot: Snapshot,
     panel_visible: bool,
@@ -80,9 +80,12 @@ fn main() {
             return;
         }
 
-        let (w, h) = ui::panel_size(GetDpiForSystem());
+        let dpi = GetDpiForSystem();
+        let s = dpi as f32 / 96.0;
+        let w = (ui::WIN_W as f32 * s).round() as i32;
+        let h = (ui::WIN_H as f32 * s).round() as i32;
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
             class.as_ptr(),
             wide("SK-vitals").as_ptr(),
             WS_POPUP,
@@ -104,7 +107,7 @@ fn main() {
         let state = App {
             hwnd,
             icon: 0,
-            fonts: Fonts::new(GetDpiForWindow(hwnd)),
+            renderer: Renderer::new(GetDpiForWindow(hwnd)),
             sampler,
             snapshot,
             panel_visible: true,
@@ -117,10 +120,9 @@ fn main() {
         add_tray(app);
         SetTimer(hwnd, TIMER_ID, 1000, None);
 
-        ui::apply_round_corners(hwnd);
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         ui::dock(hwnd);
-        InvalidateRect(hwnd, null(), 0);
+        ui::render(hwnd, &app.snapshot, &mut app.renderer);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
@@ -236,17 +238,16 @@ unsafe fn tick(app: &mut App) {
     update_tray(app);
 
     if app.panel_visible {
-        InvalidateRect(app.hwnd, null(), 0);
+        ui::render(app.hwnd, &app.snapshot, &mut app.renderer);
     }
 }
 
 unsafe fn toggle_panel(app: &mut App) {
     app.panel_visible = !app.panel_visible;
     if app.panel_visible {
-        ui::apply_round_corners(app.hwnd);
         ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
         ui::dock(app.hwnd);
-        InvalidateRect(app.hwnd, null(), 0);
+        ui::render(app.hwnd, &app.snapshot, &mut app.renderer);
     } else {
         ShowWindow(app.hwnd, SW_HIDE);
     }
@@ -321,7 +322,7 @@ unsafe fn quit(app: &mut App) {
         DestroyIcon(app.icon);
         app.icon = 0;
     }
-    app.fonts.destroy();
+    app.renderer.destroy();
     DestroyWindow(app.hwnd);
 }
 
@@ -333,7 +334,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
     match msg {
         WM_PAINT => {
-            ui::paint(hwnd, &app.snapshot, &mut app.fonts);
+            // 分层窗口不使用 GDI 绘制，这里只补一次空擦除
+            let mut ps = zeroed();
+            BeginPaint(hwnd, &mut ps);
+            EndPaint(hwnd, &mut ps);
             0
         }
         WM_ERASEBKGND => 1,
@@ -372,13 +376,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     rc.bottom - rc.top,
                     SWP_NOACTIVATE,
                 );
-                ui::apply_round_corners(hwnd);
             }
+            ui::dock(hwnd);
+            ui::render(hwnd, &app.snapshot, &mut app.renderer);
             0
         }
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
             if app.panel_visible {
                 ui::dock(hwnd);
+                ui::render(hwnd, &app.snapshot, &mut app.renderer);
             }
             0
         }

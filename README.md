@@ -11,6 +11,8 @@ Rust 原生 Win32 实现，无运行时依赖，常驻几乎不占资源。
   没有 Electron / 浏览器内核 / .NET 运行时，纯 Win32 + GDI。
 - **悬浮小窗贴靠任务栏**：自动定位在托盘通知区正上方（找不到托盘时退回屏幕右下角），
   显示 CPU、内存百分比和彩色进度条，每秒刷新；小窗可拖动，不上任务栏、不抢焦点。
+- **重新设计过的界面**：分层窗口（`UpdateLayeredWindow`）逐像素合成，抗锯齿圆角 + 柔和投影 +
+  纵向渐变深色卡片，CPU / 内存左右两栏，中间一道细分隔线，数值用大号字并按告警档位变色。
 - **托盘变色告警**：负载正常时图标为绿色，偏高转黄，过高转红；悬停 tooltip 显示实时数值和告警文案。
 - **不打扰**：默认不发通知、不弹窗，只在颜色和 tooltip 上体现；也不需要管理员权限。
 - **开机自启开关**：托盘菜单里勾选即可，写入当前用户的启动项，取消勾选即删除。
@@ -61,8 +63,13 @@ cargo build --release
 
 - CPU：`GetSystemTimes` 两次采样的 idle/total 差值，每秒一次，不轮询进程列表。
 - 内存：`GlobalMemoryStatusEx` 的 `dwMemoryLoad`。
-- 界面：`WS_POPUP` + `WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE` 无边框窗口，
-  GDI 双缓冲自绘，`SetWindowRgn` 圆角。
+- 界面：`WS_POPUP` + `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE`
+  分层窗口，无边框、不抢焦点。
+- 渲染：自绘一套轻量光栅化管线——圆角矩形用有向距离场（SDF）算逐像素抗锯齿覆盖率，
+  投影用 SDF 掩码 + 可分离盒式模糊（两遍逼近高斯），最后按预乘 alpha 合成进 32bpp DIB，
+  交给 `UpdateLayeredWindow` 一次性贴到桌面。
+- 文字：GDI 以「黑底白字 + ANTIALIASED_QUALITY」画进临时 DIB，取红通道当覆盖率再混色，
+  这样文字边缘也有抗锯齿。
 - 托盘图标：运行时用 GDI 画进 32×32 DIB，`CreateIconIndirect` 生成 `HICON`，按等级换色。
 - 依赖：仅 `windows-sys`（Win32 绑定）。
 

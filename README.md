@@ -1,18 +1,20 @@
 # SK-vitals
 
-Windows 任务栏资源监控：贴靠托盘区的悬浮小窗显示 **CPU / 内存** 占用，托盘图标随负载变色告警。
+Windows 任务栏资源监控：贴靠托盘区的悬浮小窗显示 **CPU / 内存 / CPU 温度**，托盘图标随负载变色告警。
 Rust 原生 Win32 实现，无运行时依赖，常驻几乎不占资源。
 
 ![预览](docs/preview.png)
 
 ## 特点
 
-- **真的不占资源**：单文件 exe 约 100 KB，常驻 1 个线程、约 8 MB 工作集，CPU 占用接近 0。
+- **真的不占资源**：单文件 exe 约 230 KB，常驻 2 个线程、约 12 MB 工作集，CPU 占用接近 0。
   没有 Electron / 浏览器内核 / .NET 运行时，纯 Win32 + GDI。
 - **悬浮小窗贴靠任务栏**：自动定位在托盘通知区正上方（找不到托盘时退回屏幕右下角），
-  显示 CPU、内存百分比和彩色进度条，每秒刷新；小窗可拖动，不上任务栏、不抢焦点。
+  显示 CPU、内存百分比、CPU 温度和彩色进度条，每秒刷新；小窗可拖动，不上任务栏、不抢焦点。
 - **重新设计过的界面**：分层窗口（`UpdateLayeredWindow`）逐像素合成，抗锯齿圆角 + 柔和投影 +
-  纵向渐变深色卡片，CPU / 内存左右两栏，中间一道细分隔线，数值用大号字并按告警档位变色。
+  纵向渐变深色卡片，CPU / 内存 / 温度三栏，中间两道细分隔线，数值用大号字并按告警档位变色。
+- **CPU 温度**：按 LibreHardwareMonitor → `root\hardware` → ACPI 热区 → WMI 探针的顺序自动探测数据源，
+  读不到时显示 `--`（不少主板本身就不向 Windows 暴露温度）。
 - **托盘变色告警**：负载正常时图标为绿色，偏高转黄，过高转红；悬停 tooltip 显示实时数值和告警文案。
 - **不打扰**：默认不发通知、不弹窗，只在颜色和 tooltip 上体现；也不需要管理员权限。
 - **开机自启开关**：托盘菜单里勾选即可，写入当前用户的启动项，取消勾选即删除。
@@ -35,8 +37,26 @@ Rust 原生 Win32 实现，无运行时依赖，常驻几乎不占资源。
 |---|---|---|
 | CPU | 80% | 95% |
 | 内存 | 80% | 92% |
+| 温度 | 80℃ | 95℃ |
 
-托盘图标取 CPU 与内存中更严重的那一档颜色。
+托盘图标取 CPU、内存、温度中更严重的那一档颜色。
+
+## 关于 CPU 温度
+
+Windows 没有官方的「读 CPU 温度」接口，能读到的数据都来自 WMI。程序按下面的顺序依次尝试，
+取到第一个有效值就用：
+
+| 数据源 | 说明 |
+|---|---|
+| `root\OpenHardwareMonitor` / `root\LibreHardwareMonitor` | 需要自己在后台跑 LibreHardwareMonitor（免费），最准 |
+| `root\hardware` 的 `NumericSensor` | Windows 11 24H2 起的新硬件传感器接口 |
+| `root\wmi` 的 `MSAcpi_ThermalZoneTemperature` | 笔记本的 ACPI 热区，单位 0.1K |
+| `root\cimv2` 的 `Win32_TemperatureProbe` / `CIM_TemperatureSensor` | 单位 0.1℃ |
+
+如果本机没有向 Windows 暴露温度（很多台式机主板就是这样），面板会显示 `--`，属于正常现象。
+想要真实温度，装一个 LibreHardwareMonitor 就行，不用改任何配置。
+
+温度查询放在独立后台线程里，每 15 秒一次；主线程只读缓存值，不受 WMI 慢查询影响。
 
 ## 使用
 
@@ -55,6 +75,7 @@ Rust 原生 Win32 实现，无运行时依赖，常驻几乎不占资源。
 
 ```powershell
 cargo build --release
+cargo test --release
 ```
 
 产物：`target/release/sk-vitals.exe`（几百 KB 以内，已开启 LTO / strip / opt-level=z）。
@@ -63,6 +84,8 @@ cargo build --release
 
 - CPU：`GetSystemTimes` 两次采样的 idle/total 差值，每秒一次，不轮询进程列表。
 - 内存：`GlobalMemoryStatusEx` 的 `dwMemoryLoad`。
+- 温度：`wmi` crate 读 WMI，跑在专用后台线程上（`WMIConnection` 非 `Send`，每线程各自持有连接），
+  15 秒轮询一次；某个源连续失败 3 次就休眠约 5 分钟再试，避免反复拉起 WMI 服务。
 - 界面：`WS_POPUP` + `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE`
   分层窗口，无边框、不抢焦点。
 - 渲染：自绘一套轻量光栅化管线——圆角矩形用有向距离场（SDF）算逐像素抗锯齿覆盖率，
@@ -71,7 +94,7 @@ cargo build --release
 - 文字：GDI 以「黑底白字 + ANTIALIASED_QUALITY」画进临时 DIB，取红通道当覆盖率再混色，
   这样文字边缘也有抗锯齿。
 - 托盘图标：运行时用 GDI 画进 32×32 DIB，`CreateIconIndirect` 生成 `HICON`，按等级换色。
-- 依赖：仅 `windows-sys`（Win32 绑定）。
+- 依赖：`windows-sys`（Win32 绑定）+ `wmi`（WMI 查询）。
 
 ## 作者
 

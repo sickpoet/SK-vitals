@@ -5,7 +5,7 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 use windows_sys::Win32::System::Threading::GetSystemTimes;
 
 /// 告警等级：托盘图标颜色与 tooltip 文案都由它决定
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
     Normal,
     Warn,
@@ -30,41 +30,80 @@ impl Level {
     }
 }
 
-// 阈值：改这里即可调整告警时机（百分比）
+// 阈值：改这里即可调整告警时机（百分比 / 摄氏度）
 const CPU_WARN: u8 = 80;
 const CPU_CRITICAL: u8 = 95;
 const MEM_WARN: u8 = 80;
 const MEM_CRITICAL: u8 = 92;
+const TEMP_WARN: u8 = 80;
+const TEMP_CRITICAL: u8 = 95;
 
 #[derive(Clone, Copy)]
 pub struct Snapshot {
     pub cpu: u8,
     pub mem: u8,
+    /// CPU 温度（摄氏度）；没有可用数据源时为 None
+    pub temp: Option<u8>,
     pub cpu_level: Level,
     pub mem_level: Level,
+    pub temp_level: Level,
 }
 
 impl Snapshot {
     pub fn level(&self) -> Level {
-        self.cpu_level.worst(self.mem_level)
+        self.cpu_level.worst(self.mem_level).worst(self.temp_level)
+    }
+
+    /// 填入温度并重算温度等级
+    pub fn with_temp(mut self, temp: Option<u8>) -> Self {
+        self.temp_level = match temp {
+            Some(t) => level_of(t, TEMP_WARN, TEMP_CRITICAL),
+            None => Level::Normal,
+        };
+        self.temp = temp;
+        self
     }
 
     pub fn tooltip(&self) -> String {
-        let mut tip = format!("SK-vitals\nCPU {}% · 内存 {}%", self.cpu, self.mem);
-        match (self.cpu_level, self.mem_level) {
-            (Level::Normal, Level::Normal) => {}
-            (cpu, mem) => {
-                tip.push('\n');
-                if cpu != Level::Normal {
-                    tip.push_str(if cpu == Level::Critical { "CPU 过高" } else { "CPU 偏高" });
-                }
-                if mem != Level::Normal {
-                    if cpu != Level::Normal {
-                        tip.push(' ');
-                    }
-                    tip.push_str(if mem == Level::Critical { "内存吃紧" } else { "内存偏紧" });
-                }
+        let temp_text = match self.temp {
+            Some(t) => format!("{}°C", t),
+            None => "--".to_string(),
+        };
+        let mut tip = format!(
+            "SK-vitals\nCPU {}% · 内存 {}% · 温度 {}",
+            self.cpu, self.mem, temp_text
+        );
+        let mut notes = String::new();
+        if self.cpu_level != Level::Normal {
+            notes.push_str(if self.cpu_level == Level::Critical {
+                "CPU 过高"
+            } else {
+                "CPU 偏高"
+            });
+        }
+        if self.mem_level != Level::Normal {
+            if !notes.is_empty() {
+                notes.push(' ');
             }
+            notes.push_str(if self.mem_level == Level::Critical {
+                "内存吃紧"
+            } else {
+                "内存偏紧"
+            });
+        }
+        if self.temp_level != Level::Normal {
+            if !notes.is_empty() {
+                notes.push(' ');
+            }
+            notes.push_str(if self.temp_level == Level::Critical {
+                "温度过高"
+            } else {
+                "温度偏高"
+            });
+        }
+        if !notes.is_empty() {
+            tip.push('\n');
+            tip.push_str(&notes);
         }
         tip
     }
@@ -145,8 +184,60 @@ impl Sampler {
         Snapshot {
             cpu,
             mem,
+            temp: None,
             cpu_level: level_of(cpu, CPU_WARN, CPU_CRITICAL),
             mem_level: level_of(mem, MEM_WARN, MEM_CRITICAL),
+            temp_level: Level::Normal,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(cpu: u8, mem: u8) -> Snapshot {
+        Snapshot {
+            cpu,
+            mem,
+            temp: None,
+            cpu_level: level_of(cpu, CPU_WARN, CPU_CRITICAL),
+            mem_level: level_of(mem, MEM_WARN, MEM_CRITICAL),
+            temp_level: Level::Normal,
+        }
+    }
+
+    #[test]
+    fn temp_raises_level() {
+        let s = snap(10, 10).with_temp(Some(97));
+        assert_eq!(s.temp_level, Level::Critical);
+        assert_eq!(s.level(), Level::Critical);
+    }
+
+    #[test]
+    fn no_temp_keeps_level() {
+        let s = snap(96, 10).with_temp(None);
+        assert_eq!(s.temp_level, Level::Normal);
+        assert_eq!(s.level(), Level::Critical);
+    }
+
+    #[test]
+    fn tooltip_shows_temperature() {
+        let s = snap(10, 20).with_temp(Some(55));
+        let tip = s.tooltip();
+        assert!(tip.contains("温度 55°C"), "got {}", tip);
+        assert!(!tip.contains("温度过高"), "got {}", tip);
+    }
+
+    #[test]
+    fn tooltip_marks_overheat() {
+        let s = snap(10, 20).with_temp(Some(99));
+        assert!(s.tooltip().contains("温度过高"), "got {}", s.tooltip());
+    }
+
+    #[test]
+    fn tooltip_marks_missing_temperature() {
+        let s = snap(10, 20).with_temp(None);
+        assert!(s.tooltip().contains("温度 --"), "got {}", s.tooltip());
     }
 }

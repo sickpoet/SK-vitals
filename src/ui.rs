@@ -11,7 +11,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::stats::{Level, Snapshot};
 
 /// 卡片尺寸（96 DPI 逻辑单位，不含阴影留白）
-const CARD_W: i32 = 236;
+const CARD_W: i32 = 320;
 const CARD_H: i32 = 50;
 /// 卡片四周为投影预留的空白
 const MARGIN_X: i32 = 12;
@@ -373,37 +373,52 @@ pub fn render(hwnd: HWND, snapshot: &Snapshot, r: &mut Renderer) {
         }
 
         let pad = (18.0 * s).round() as i32;
-        let col_gap = (32.0 * s).round() as i32;
-        let col_w = (cw - pad * 2 - col_gap) / 2;
-        let col2_x = pad + col_w + col_gap;
+        let col_gap = (30.0 * s).round() as i32;
+        let col_w = (cw - pad * 2 - col_gap * 2) / 3;
+        let col_x = [
+            pad,
+            pad + col_w + col_gap,
+            pad + (col_w + col_gap) * 2,
+        ];
         let row_top = (8.0 * s).round() as i32;
         let row_h = (22.0 * s).round() as i32;
         let bar_h = ((4.0 * s).round() as i32).max(3);
         let bar_y = (35.0 * s).round() as i32;
 
         // 分隔线
-        let div_x = pad + col_w + col_gap / 2;
         let div_top = (10.0 * s).round() as i32;
         let div_bottom = (40.0 * s).round() as i32;
-        for y in div_top..div_bottom.min(ch) {
-            for x in (div_x - 1).max(0)..(div_x + 1).min(cw) {
-                let i = ((y * cw + x) * 3) as usize;
-                buf_blend_white(&mut card, i, 0.08);
+        for k in 1..3 {
+            let div_x = col_x[k] - col_gap / 2;
+            for y in div_top..div_bottom.min(ch) {
+                for x in (div_x - 1).max(0)..(div_x + 1).min(cw) {
+                    let i = ((y * cw + x) * 3) as usize;
+                    buf_blend_white(&mut card, i, 0.08);
+                }
             }
         }
 
-        // 两条进度条
-        draw_bar(&mut card, cw, ch, pad, bar_y, col_w, bar_h, snapshot.cpu, color_for(snapshot.cpu_level));
+        // 三个指标
+        let cpu_text = format!("{}", snapshot.cpu);
+        let mem_text = format!("{}", snapshot.mem);
+        let (temp_text, temp_unit) = match snapshot.temp {
+            Some(t) => (format!("{}", t), Some("°C")),
+            None => ("--".to_string(), None),
+        };
+
+        // 进度条：CPU / 内存按百分比，温度按 0~100℃ 刻度
+        draw_bar(&mut card, cw, ch, col_x[0], bar_y, col_w, bar_h, snapshot.cpu, color_for(snapshot.cpu_level));
+        draw_bar(&mut card, cw, ch, col_x[1], bar_y, col_w, bar_h, snapshot.mem, color_for(snapshot.mem_level));
         draw_bar(
             &mut card,
             cw,
             ch,
-            col2_x,
+            col_x[2],
             bar_y,
             col_w,
             bar_h,
-            snapshot.mem,
-            color_for(snapshot.mem_level),
+            snapshot.temp.unwrap_or(0).min(100),
+            color_for(snapshot.temp_level),
         );
 
         // 文本
@@ -412,11 +427,12 @@ pub fn render(hwnd: HWND, snapshot: &Snapshot, r: &mut Renderer) {
             &mut card,
             cw,
             ch,
-            pad,
+            col_x[0],
             row_top,
             row_h,
             "CPU",
-            snapshot.cpu,
+            &cpu_text,
+            Some("%"),
             snapshot.cpu_level,
         );
         draw_metric(
@@ -424,12 +440,26 @@ pub fn render(hwnd: HWND, snapshot: &Snapshot, r: &mut Renderer) {
             &mut card,
             cw,
             ch,
-            col2_x,
+            col_x[1],
             row_top,
             row_h,
             "内存",
-            snapshot.mem,
+            &mem_text,
+            Some("%"),
             snapshot.mem_level,
+        );
+        draw_metric(
+            r,
+            &mut card,
+            cw,
+            ch,
+            col_x[2],
+            row_top,
+            row_h,
+            "温度",
+            &temp_text,
+            temp_unit,
+            snapshot.temp_level,
         );
 
         // ---------- 投影 ----------
@@ -579,7 +609,7 @@ unsafe fn text_width(r: &mut Renderer, font: HFONT, text: &str) -> i32 {
     rc.right - rc.left
 }
 
-/// 画一列指标：标签 + 大号数值（数值紧跟标签，整体靠左）
+/// 画一列指标：标签 + 大号数值（数值紧跟标签，单位用小号弱化字跟在数值后）
 unsafe fn draw_metric(
     r: &mut Renderer,
     card: &mut [u8],
@@ -589,15 +619,15 @@ unsafe fn draw_metric(
     top: i32,
     height: i32,
     label: &str,
-    value: u8,
+    value: &str,
+    unit: Option<&str>,
     level: Level,
 ) {
     let f_label = r.fonts.label;
     let f_value = r.fonts.value;
 
-    let text = format!("{}%", value);
     let label_w = text_width(r, f_label, label);
-    let value_w = text_width(r, f_value, &text);
+    let value_w = text_width(r, f_value, value);
     let gap = (9.0 * r.dpi as f32 / 96.0).round() as i32;
 
     // 标签
@@ -618,8 +648,11 @@ unsafe fn draw_metric(
         DT_LEFT,
     );
 
-    // 数值：大号数字（带百分号）
-    let value_color = if level == Level::Normal {
+    // 数值：大号数字
+    let value_color = if value == "--" {
+        // 没有数据源，用弱化色显示占位符
+        LABEL_COLOR
+    } else if level == Level::Normal {
         VALUE_COLOR
     } else {
         color_for(level)
@@ -631,7 +664,7 @@ unsafe fn draw_metric(
         cw,
         ch,
         f_value,
-        &text,
+        value,
         RECT {
             left: vx,
             top,
@@ -641,6 +674,28 @@ unsafe fn draw_metric(
         value_color,
         DT_LEFT,
     );
+
+    // 单位：小一号、颜色更弱
+    if let Some(unit) = unit {
+        let unit_w = text_width(r, f_label, unit);
+        let ux = vx + value_w + (2.0 * r.dpi as f32 / 96.0).round() as i32;
+        draw_text_mask(
+            r,
+            card,
+            cw,
+            ch,
+            f_label,
+            unit,
+            RECT {
+                left: ux,
+                top,
+                right: ux + unit_w + 2,
+                bottom: top + height,
+            },
+            LABEL_COLOR,
+            DT_LEFT,
+        );
+    }
 }
 
 /// 用 GDI 把文字画成掩码，再按覆盖率混色，得到带 alpha 的抗锯齿文字

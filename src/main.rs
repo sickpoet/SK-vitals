@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod stats;
+mod temp;
 mod ui;
 
 use std::mem::{size_of, zeroed};
@@ -16,6 +17,7 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use stats::{Sampler, Snapshot};
+use temp::TempReader;
 use ui::{wide, Renderer};
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -36,6 +38,7 @@ struct App {
     icon: HICON,
     renderer: Renderer,
     sampler: Sampler,
+    temp: TempReader,
     snapshot: Snapshot,
     panel_visible: bool,
     taskbar_msg: u32,
@@ -103,12 +106,14 @@ fn main() {
         }
 
         let mut sampler = Sampler::new();
-        let snapshot = sampler.sample();
+        let temp = TempReader::start();
+        let snapshot = sampler.sample().with_temp(temp.read());
         let state = App {
             hwnd,
             icon: 0,
             renderer: Renderer::new(GetDpiForWindow(hwnd)),
             sampler,
+            temp,
             snapshot,
             panel_visible: true,
             taskbar_msg: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
@@ -225,7 +230,7 @@ fn set_autostart(enabled: bool) -> bool {
 }
 
 unsafe fn tick(app: &mut App) {
-    let snapshot = app.sampler.sample();
+    let snapshot = app.sampler.sample().with_temp(app.temp.read());
     let level_changed = snapshot.level() != app.snapshot.level();
     app.snapshot = snapshot;
 

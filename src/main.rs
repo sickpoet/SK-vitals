@@ -8,8 +8,10 @@ use std::ptr::null;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::UI::HiDpi::*;
+use windows_sys::Win32::UI::Input::Ime::ImmDisableIME;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -22,7 +24,12 @@ const TIMER_ID: usize = 1;
 const TRAY_UID: u32 = 1;
 const MENU_TOGGLE: u32 = 1;
 const MENU_QUIT: u32 = 2;
+const MENU_AUTOSTART: u32 = 3;
 const CLASS_NAME: &str = "SKVitalsPanel";
+
+// HKCU 下的 Run 项，不需要管理员权限
+const AUTOSTART_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const AUTOSTART_VALUE: &str = "SK-vitals";
 
 struct App {
     hwnd: HWND,
@@ -44,6 +51,8 @@ fn main() {
     unsafe {
         // 尽早声明 DPI 感知，否则悬浮窗在缩放屏上会被系统拉伸糊掉
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // 程序没有任何文本输入，禁用输入法：避免打开托盘菜单时把输入法组件加载进进程
+        ImmDisableIME(0);
 
         let class = wide(CLASS_NAME);
 
@@ -147,6 +156,72 @@ unsafe fn update_tray(app: &App) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+fn exe_path() -> Option<String> {
+    unsafe {
+        let mut buf = [0u16; 1024];
+        let len = GetModuleFileNameW(0, buf.as_mut_ptr(), buf.len() as u32);
+        if len == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+/// 读 HKCU\...\Run，看本程序的启动项在不在
+fn is_autostart_enabled() -> bool {
+    unsafe {
+        let mut hkey: HKEY = 0;
+        if RegOpenKeyExW(HKEY_CURRENT_USER, wide(AUTOSTART_KEY).as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return false;
+        }
+
+        let name = wide(AUTOSTART_VALUE);
+        let mut kind: REG_VALUE_TYPE = 0;
+        let mut buf = [0u16; 512];
+        let mut size = (size_of::<u16>() * buf.len()) as u32;
+        let status = RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            null(),
+            &mut kind,
+            buf.as_mut_ptr() as *mut u8,
+            &mut size,
+        );
+        RegCloseKey(hkey);
+        status == 0
+    }
+}
+
+/// 写入 / 删除开机启动项，失败返回 false
+fn set_autostart(enabled: bool) -> bool {
+    unsafe {
+        let mut hkey: HKEY = 0;
+        if RegOpenKeyExW(HKEY_CURRENT_USER, wide(AUTOSTART_KEY).as_ptr(), 0, KEY_SET_VALUE, &mut hkey) != 0 {
+            return false;
+        }
+
+        let name = wide(AUTOSTART_VALUE);
+        let ok = if enabled {
+            match exe_path() {
+                Some(path) => {
+                    // 路径带空格时必须加引号
+                    let value = wide(&format!("\"{}\"", path));
+                    let bytes = (value.len() * size_of::<u16>()) as u32;
+                    RegSetValueExW(hkey, name.as_ptr(), 0, REG_SZ, value.as_ptr() as *const u8, bytes) == 0
+                }
+                None => false,
+            }
+        } else {
+            // 2 = ERROR_FILE_NOT_FOUND，本来就没有也算成功
+            let status = RegDeleteValueW(hkey, name.as_ptr());
+            status == 0 || status == 2
+        };
+
+        RegCloseKey(hkey);
+        ok
+    }
+}
+
 unsafe fn tick(app: &mut App) {
     let snapshot = app.sampler.sample();
     let level_changed = snapshot.level() != app.snapshot.level();
@@ -191,6 +266,17 @@ unsafe fn show_menu(app: &mut App) {
         "显示悬浮窗"
     };
     AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, wide(toggle_text).as_ptr());
+    let autostart_flags = if is_autostart_enabled() {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING
+    };
+    AppendMenuW(
+        menu,
+        autostart_flags,
+        MENU_AUTOSTART as usize,
+        wide("开机自启").as_ptr(),
+    );
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, wide("退出").as_ptr());
 
@@ -210,6 +296,16 @@ unsafe fn show_menu(app: &mut App) {
 
     match cmd as u32 {
         MENU_TOGGLE => toggle_panel(app),
+        MENU_AUTOSTART => {
+            if !set_autostart(!is_autostart_enabled()) {
+                MessageBoxW(
+                    app.hwnd,
+                    wide("写入开机启动项失败。").as_ptr(),
+                    wide("SK-vitals").as_ptr(),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+        }
         MENU_QUIT => quit(app),
         _ => {}
     }

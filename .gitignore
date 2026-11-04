@@ -2,3 +2,4 @@
 *.pdb
 *.exp
 *.lib
+__pycache__/

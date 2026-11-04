@@ -71,13 +71,15 @@ fn main() {
         }
 
         let hinst = GetModuleHandleW(null());
+        // exe 资源里的应用图标（资源 ID 1），由 build.rs 用 winresource 嵌入
+        let app_icon = LoadIconW(hinst, 1usize as *const u16);
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinst,
-            hIcon: 0,
+            hIcon: app_icon,
             hCursor: 0,
             hbrBackground: 0,
             lpszMenuName: null(),

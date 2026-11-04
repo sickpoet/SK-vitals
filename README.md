@@ -5,6 +5,8 @@ Rust 原生 Win32 实现，无运行时依赖，常驻几乎不占资源。
 
 ![预览](docs/preview.png)
 
+![图标](docs/icon.png)
+
 ## 特点
 
 - **真的不占资源**：单文件 exe 约 230 KB，常驻 2 个线程、约 12 MB 工作集，CPU 占用接近 0。
@@ -16,6 +18,8 @@ Rust 原生 Win32 实现，无运行时依赖，常驻几乎不占资源。
 - **CPU 温度**：按 LibreHardwareMonitor → `root\hardware` → ACPI 热区 → WMI 探针的顺序自动探测数据源，
   读不到时显示 `--`（不少主板本身就不向 Windows 暴露温度）。
 - **托盘变色告警**：负载正常时图标为绿色，偏高转黄，过高转红；悬停 tooltip 显示实时数值和告警文案。
+- **自带应用图标**：exe 里有完整的多尺寸图标（16/24/32/48/64/128/256）和版本信息，
+  任务栏、资源管理器、桌面快捷方式都显示自己的图标，不再是那个空白方块。
 - **不打扰**：默认不发通知、不弹窗，只在颜色和 tooltip 上体现；也不需要管理员权限。
 - **开机自启开关**：托盘菜单里勾选即可，写入当前用户的启动项，取消勾选即删除。
 - **可勾选的显示开关**：「启动时显示悬浮窗」和「显示温度」都是菜单里的勾选项，状态存注册表持久化。
@@ -116,10 +120,13 @@ cargo test --release
 - 文字：GDI 以「黑底白字 + ANTIALIASED_QUALITY」画进临时 DIB，取红通道当覆盖率再混色，
   这样文字边缘也有抗锯齿。
 - 托盘图标：运行时用 GDI 画进 32×32 DIB，`CreateIconIndirect` 生成 `HICON`，按等级换色。
+- 应用图标：`build.rs` 用 `winresource` 把 `assets/sk-vitals.ico`（多尺寸）连同 VERSIONINFO、
+  manifest 一起编进 exe；图标源由 `tools/make_icon.py` 生成（Python + PIL，每个尺寸单独按
+  比例重绘再降采样，16px 也不糊）。改样式后重跑 `python tools/make_icon.py` 即可。
 - 设置持久化：`HKCU\Software\SK-vitals` 下的 REG_DWORD；开机自启用 `HKCU\...\CurrentVersion\Run`，
   写入时带 `--startup` 参数，用来区分「开机自启拉起」和「用户手动启动」——
   只有前者才受「启动时显示悬浮窗」开关影响。
-- 依赖：`windows-sys`（Win32 绑定）+ `wmi`（WMI 查询）。
+- 依赖：`windows-sys`（Win32 绑定）+ `wmi`（WMI 查询）；构建期用 `winresource` 编译资源。
 
 ## 作者
 

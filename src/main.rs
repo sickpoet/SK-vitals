@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod settings;
 mod stats;
 mod temp;
 mod ui;
@@ -9,13 +10,14 @@ use std::ptr::null;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint};
+use windows_sys::Win32::System::Environment::GetCommandLineW;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
-use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::Ime::ImmDisableIME;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use settings::Settings;
 use stats::{Sampler, Snapshot};
 use temp::TempReader;
 use ui::{wide, Renderer};
@@ -27,11 +29,9 @@ const TRAY_UID: u32 = 1;
 const MENU_TOGGLE: u32 = 1;
 const MENU_QUIT: u32 = 2;
 const MENU_AUTOSTART: u32 = 3;
+const MENU_PANEL_ON_START: u32 = 4;
+const MENU_SHOW_TEMP: u32 = 5;
 const CLASS_NAME: &str = "SKVitalsPanel";
-
-// HKCU 下的 Run 项，不需要管理员权限
-const AUTOSTART_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const AUTOSTART_VALUE: &str = "SK-vitals";
 
 struct App {
     hwnd: HWND,
@@ -42,6 +42,7 @@ struct App {
     snapshot: Snapshot,
     panel_visible: bool,
     taskbar_msg: u32,
+    settings: Settings,
 }
 
 static mut APP: *mut App = std::ptr::null_mut();
@@ -58,6 +59,9 @@ fn main() {
         ImmDisableIME(0);
 
         let class = wide(CLASS_NAME);
+
+        // --startup 表示是开机自启拉起的；手动启动一律显示悬浮窗
+        let startup = launched_by_startup();
 
         // 单实例：再次启动只是把已运行的悬浮窗显示出来
         let running = FindWindowW(class.as_ptr(), null());
@@ -85,7 +89,8 @@ fn main() {
 
         let dpi = GetDpiForSystem();
         let s = dpi as f32 / 96.0;
-        let w = (ui::WIN_W as f32 * s).round() as i32;
+        let settings = Settings::load();
+        let w = (ui::win_width(settings.show_temp) as f32 * s).round() as i32;
         let h = (ui::WIN_H as f32 * s).round() as i32;
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
@@ -107,16 +112,18 @@ fn main() {
 
         let mut sampler = Sampler::new();
         let temp = TempReader::start();
-        let snapshot = sampler.sample().with_temp(temp.read());
+        temp.set_enabled(settings.show_temp);
+        let snapshot = sampler.sample().with_temp(temp.read(), settings.show_temp);
         let state = App {
             hwnd,
             icon: 0,
-            renderer: Renderer::new(GetDpiForWindow(hwnd)),
+            renderer: Renderer::new(GetDpiForWindow(hwnd), settings.show_temp),
             sampler,
             temp,
             snapshot,
-            panel_visible: true,
+            panel_visible: !startup || settings.panel_on_start,
             taskbar_msg: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
+            settings,
         };
         APP = Box::into_raw(Box::new(state));
 
@@ -125,9 +132,11 @@ fn main() {
         add_tray(app);
         SetTimer(hwnd, TIMER_ID, 1000, None);
 
-        ui::dock(hwnd);
-        ui::render(hwnd, &app.snapshot, &mut app.renderer);
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        ui::dock(hwnd, app.settings.show_temp);
+        if app.panel_visible {
+            ui::render(hwnd, &app.snapshot, &mut app.renderer);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, 0, 0, 0) > 0 {
@@ -174,63 +183,27 @@ fn exe_path() -> Option<String> {
     }
 }
 
-/// 读 HKCU\...\Run，看本程序的启动项在不在
-fn is_autostart_enabled() -> bool {
+/// 命令行里带 --startup 说明是开机自启拉起的
+fn launched_by_startup() -> bool {
     unsafe {
-        let mut hkey: HKEY = 0;
-        if RegOpenKeyExW(HKEY_CURRENT_USER, wide(AUTOSTART_KEY).as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+        let cmd = GetCommandLineW();
+        if cmd.is_null() {
             return false;
         }
-
-        let name = wide(AUTOSTART_VALUE);
-        let mut kind: REG_VALUE_TYPE = 0;
-        let mut buf = [0u16; 512];
-        let mut size = (size_of::<u16>() * buf.len()) as u32;
-        let status = RegQueryValueExW(
-            hkey,
-            name.as_ptr(),
-            null(),
-            &mut kind,
-            buf.as_mut_ptr() as *mut u8,
-            &mut size,
-        );
-        RegCloseKey(hkey);
-        status == 0
-    }
-}
-
-/// 写入 / 删除开机启动项，失败返回 false
-fn set_autostart(enabled: bool) -> bool {
-    unsafe {
-        let mut hkey: HKEY = 0;
-        if RegOpenKeyExW(HKEY_CURRENT_USER, wide(AUTOSTART_KEY).as_ptr(), 0, KEY_SET_VALUE, &mut hkey) != 0 {
-            return false;
+        let mut len = 0usize;
+        while *cmd.add(len) != 0 {
+            len += 1;
         }
-
-        let name = wide(AUTOSTART_VALUE);
-        let ok = if enabled {
-            match exe_path() {
-                Some(path) => {
-                    // 路径带空格时必须加引号
-                    let value = wide(&format!("\"{}\"", path));
-                    let bytes = (value.len() * size_of::<u16>()) as u32;
-                    RegSetValueExW(hkey, name.as_ptr(), 0, REG_SZ, value.as_ptr() as *const u8, bytes) == 0
-                }
-                None => false,
-            }
-        } else {
-            // 2 = ERROR_FILE_NOT_FOUND，本来就没有也算成功
-            let status = RegDeleteValueW(hkey, name.as_ptr());
-            status == 0 || status == 2
-        };
-
-        RegCloseKey(hkey);
-        ok
+        let line = String::from_utf16_lossy(std::slice::from_raw_parts(cmd, len));
+        line.split_whitespace().any(|a| a == "--startup")
     }
 }
 
 unsafe fn tick(app: &mut App) {
-    let snapshot = app.sampler.sample().with_temp(app.temp.read());
+    let snapshot = app
+        .sampler
+        .sample()
+        .with_temp(app.temp.read(), app.settings.show_temp);
     let level_changed = snapshot.level() != app.snapshot.level();
     app.snapshot = snapshot;
 
@@ -251,10 +224,29 @@ unsafe fn toggle_panel(app: &mut App) {
     app.panel_visible = !app.panel_visible;
     if app.panel_visible {
         ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
-        ui::dock(app.hwnd);
+        ui::dock(app.hwnd, app.settings.show_temp);
         ui::render(app.hwnd, &app.snapshot, &mut app.renderer);
     } else {
         ShowWindow(app.hwnd, SW_HIDE);
+    }
+}
+
+/// 切换温度栏：卡片宽度会变，要重新分配位图并重排
+unsafe fn toggle_show_temp(app: &mut App) {
+    app.settings.show_temp = !app.settings.show_temp;
+    app.settings.save();
+    app.temp.set_enabled(app.settings.show_temp);
+    app.renderer.set_show_temp(app.settings.show_temp);
+
+    let dpi = GetDpiForWindow(app.hwnd);
+    let s = dpi as f32 / 96.0;
+    let w = (ui::win_width(app.settings.show_temp) as f32 * s).round() as i32;
+    let h = (ui::WIN_H as f32 * s).round() as i32;
+    SetWindowPos(app.hwnd, HWND_TOPMOST, 0, 0, w, h, SWP_NOMOVE | SWP_NOACTIVATE);
+
+    ui::dock(app.hwnd, app.settings.show_temp);
+    if app.panel_visible {
+        ui::render(app.hwnd, &app.snapshot, &mut app.renderer);
     }
 }
 
@@ -272,7 +264,9 @@ unsafe fn show_menu(app: &mut App) {
         "显示悬浮窗"
     };
     AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, wide(toggle_text).as_ptr());
-    let autostart_flags = if is_autostart_enabled() {
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+
+    let autostart_flags = if settings::is_autostart_enabled() {
         MF_STRING | MF_CHECKED
     } else {
         MF_STRING
@@ -283,6 +277,31 @@ unsafe fn show_menu(app: &mut App) {
         MENU_AUTOSTART as usize,
         wide("开机自启").as_ptr(),
     );
+
+    let panel_flags = if app.settings.panel_on_start {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING
+    };
+    AppendMenuW(
+        menu,
+        panel_flags,
+        MENU_PANEL_ON_START as usize,
+        wide("启动时显示悬浮窗").as_ptr(),
+    );
+
+    let temp_flags = if app.settings.show_temp {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING
+    };
+    AppendMenuW(
+        menu,
+        temp_flags,
+        MENU_SHOW_TEMP as usize,
+        wide("显示温度").as_ptr(),
+    );
+
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, wide("退出").as_ptr());
 
@@ -303,7 +322,9 @@ unsafe fn show_menu(app: &mut App) {
     match cmd as u32 {
         MENU_TOGGLE => toggle_panel(app),
         MENU_AUTOSTART => {
-            if !set_autostart(!is_autostart_enabled()) {
+            let enable = !settings::is_autostart_enabled();
+            let path = exe_path().unwrap_or_default();
+            if !settings::set_autostart(enable, &path) {
                 MessageBoxW(
                     app.hwnd,
                     wide("写入开机启动项失败。").as_ptr(),
@@ -312,6 +333,16 @@ unsafe fn show_menu(app: &mut App) {
                 );
             }
         }
+        MENU_PANEL_ON_START => {
+            app.settings.panel_on_start = !app.settings.panel_on_start;
+            app.settings.save();
+            // 取消勾选时顺手把当前小窗也收起来，让效果立刻可见
+            if !app.settings.panel_on_start && app.panel_visible {
+                app.panel_visible = false;
+                ShowWindow(app.hwnd, SW_HIDE);
+            }
+        }
+        MENU_SHOW_TEMP => toggle_show_temp(app),
         MENU_QUIT => quit(app),
         _ => {}
     }
@@ -382,13 +413,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     SWP_NOACTIVATE,
                 );
             }
-            ui::dock(hwnd);
-            ui::render(hwnd, &app.snapshot, &mut app.renderer);
+            ui::dock(hwnd, app.settings.show_temp);
+            if app.panel_visible {
+                ui::render(hwnd, &app.snapshot, &mut app.renderer);
+            }
             0
         }
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
             if app.panel_visible {
-                ui::dock(hwnd);
+                ui::dock(hwnd, app.settings.show_temp);
                 ui::render(hwnd, &app.snapshot, &mut app.renderer);
             }
             0

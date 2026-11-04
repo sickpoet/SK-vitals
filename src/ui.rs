@@ -11,15 +11,28 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::stats::{Level, Snapshot};
 
 /// 卡片尺寸（96 DPI 逻辑单位，不含阴影留白）
-const CARD_W: i32 = 320;
+/// 三栏（带温度）比两栏宽
+const CARD_W_3COL: i32 = 320;
+const CARD_W_2COL: i32 = 236;
 const CARD_H: i32 = 50;
 /// 卡片四周为投影预留的空白
 const MARGIN_X: i32 = 12;
 const MARGIN_TOP: i32 = 10;
 const MARGIN_BOTTOM: i32 = 16;
 
+/// 卡片宽度
+pub fn card_width(show_temp: bool) -> i32 {
+    if show_temp {
+        CARD_W_3COL
+    } else {
+        CARD_W_2COL
+    }
+}
+
 /// 整个窗口尺寸（卡片 + 阴影留白）
-pub const WIN_W: i32 = CARD_W + MARGIN_X * 2;
+pub fn win_width(show_temp: bool) -> i32 {
+    card_width(show_temp) + MARGIN_X * 2
+}
 pub const WIN_H: i32 = CARD_H + MARGIN_TOP + MARGIN_BOTTOM;
 
 const CARD_RADIUS: f32 = 13.0;
@@ -165,6 +178,8 @@ fn make_font(dpi: u32, px: i32, weight: i32, face: &str) -> HFONT {
 /// 渲染器：持有分层窗口用的 DIB、文本掩码用的临时 DIB 与字体
 pub struct Renderer {
     dpi: u32,
+    /// 是否显示温度栏（决定卡片宽度）
+    show_temp: bool,
     fonts: Fonts,
     // 最终合成的窗口位图
     dc: HDC,
@@ -183,9 +198,10 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(dpi: u32) -> Self {
+    pub fn new(dpi: u32, show_temp: bool) -> Self {
         let mut r = Renderer {
             dpi,
+            show_temp,
             fonts: Fonts::new(dpi),
             dc: 0,
             dib: 0,
@@ -204,12 +220,20 @@ impl Renderer {
         r
     }
 
+    /// 切换温度栏后卡片宽度变了，需要重新分配位图
+    pub fn set_show_temp(&mut self, show_temp: bool) {
+        if self.show_temp != show_temp {
+            self.show_temp = show_temp;
+            self.alloc(self.dpi);
+        }
+    }
+
     fn alloc(&mut self, dpi: u32) {
         unsafe {
             let s = dpi as f32 / 96.0;
-            self.cw = (CARD_W as f32 * s).round() as i32;
+            self.cw = (card_width(self.show_temp) as f32 * s).round() as i32;
             self.ch = (CARD_H as f32 * s).round() as i32;
-            self.ww = (WIN_W as f32 * s).round() as i32;
+            self.ww = (win_width(self.show_temp) as f32 * s).round() as i32;
             self.wh = (WIN_H as f32 * s).round() as i32;
 
             let screen = GetDC(0);
@@ -374,7 +398,8 @@ pub fn render(hwnd: HWND, snapshot: &Snapshot, r: &mut Renderer) {
 
         let pad = (18.0 * s).round() as i32;
         let col_gap = (30.0 * s).round() as i32;
-        let col_w = (cw - pad * 2 - col_gap * 2) / 3;
+        let ncols = if r.show_temp { 3 } else { 2 };
+        let col_w = (cw - pad * 2 - col_gap * (ncols - 1)) / ncols;
         let col_x = [
             pad,
             pad + col_w + col_gap,
@@ -388,8 +413,8 @@ pub fn render(hwnd: HWND, snapshot: &Snapshot, r: &mut Renderer) {
         // 分隔线
         let div_top = (10.0 * s).round() as i32;
         let div_bottom = (40.0 * s).round() as i32;
-        for k in 1..3 {
-            let div_x = col_x[k] - col_gap / 2;
+        for k in 1..ncols {
+            let div_x = col_x[k as usize] - col_gap / 2;
             for y in div_top..div_bottom.min(ch) {
                 for x in (div_x - 1).max(0)..(div_x + 1).min(cw) {
                     let i = ((y * cw + x) * 3) as usize;
@@ -409,17 +434,6 @@ pub fn render(hwnd: HWND, snapshot: &Snapshot, r: &mut Renderer) {
         // 进度条：CPU / 内存按百分比，温度按 0~100℃ 刻度
         draw_bar(&mut card, cw, ch, col_x[0], bar_y, col_w, bar_h, snapshot.cpu, color_for(snapshot.cpu_level));
         draw_bar(&mut card, cw, ch, col_x[1], bar_y, col_w, bar_h, snapshot.mem, color_for(snapshot.mem_level));
-        draw_bar(
-            &mut card,
-            cw,
-            ch,
-            col_x[2],
-            bar_y,
-            col_w,
-            bar_h,
-            snapshot.temp.unwrap_or(0).min(100),
-            color_for(snapshot.temp_level),
-        );
 
         // 文本
         draw_metric(
@@ -448,19 +462,33 @@ pub fn render(hwnd: HWND, snapshot: &Snapshot, r: &mut Renderer) {
             Some("%"),
             snapshot.mem_level,
         );
-        draw_metric(
-            r,
-            &mut card,
-            cw,
-            ch,
-            col_x[2],
-            row_top,
-            row_h,
-            "温度",
-            &temp_text,
-            temp_unit,
-            snapshot.temp_level,
-        );
+
+        if r.show_temp {
+            draw_bar(
+                &mut card,
+                cw,
+                ch,
+                col_x[2],
+                bar_y,
+                col_w,
+                bar_h,
+                snapshot.temp.unwrap_or(0).min(100),
+                color_for(snapshot.temp_level),
+            );
+            draw_metric(
+                r,
+                &mut card,
+                cw,
+                ch,
+                col_x[2],
+                row_top,
+                row_h,
+                "温度",
+                &temp_text,
+                temp_unit,
+                snapshot.temp_level,
+            );
+        }
 
         // ---------- 投影 ----------
         let radius = CARD_RADIUS * s;
@@ -841,15 +869,15 @@ fn rgb_of(c: (u8, u8, u8)) -> COLORREF {
 }
 
 /// 贴靠任务栏：优先放到托盘通知区正上方，取不到再退回工作区右下角
-pub fn dock(hwnd: HWND) {
+pub fn dock(hwnd: HWND, show_temp: bool) {
     unsafe {
         let dpi = GetDpiForWindow(hwnd);
         let s = dpi as f32 / 96.0;
-        let cw = (CARD_W as f32 * s).round() as i32;
+        let cw = (card_width(show_temp) as f32 * s).round() as i32;
         let ch = (CARD_H as f32 * s).round() as i32;
         let mw = (MARGIN_X as f32 * s).round() as i32;
         let mt = (MARGIN_TOP as f32 * s).round() as i32;
-        let ww = (WIN_W as f32 * s).round() as i32;
+        let ww = (win_width(show_temp) as f32 * s).round() as i32;
         let wh = (WIN_H as f32 * s).round() as i32;
 
         let (card_x, card_y) = anchor(cw, ch);

@@ -10,7 +10,7 @@
 //! 全部取不到就返回 `None`，界面显示 `--`。查询放在后台线程里按低频轮询，
 //! 主线程只读缓存值，不占用 UI 线程。
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -28,18 +28,21 @@ const DORMANT_CYCLES: u64 = 20;
 /// 后台温度读取器。主线程只调用 [`TempReader::read`] 读缓存。
 pub struct TempReader {
     value: Arc<AtomicI32>,
+    enabled: Arc<AtomicBool>,
 }
 
 impl TempReader {
     /// 启动后台轮询线程
     pub fn start() -> Self {
         let value = Arc::new(AtomicI32::new(NO_VALUE));
+        let enabled = Arc::new(AtomicBool::new(true));
         let slot = value.clone();
+        let flag = enabled.clone();
         let _ = thread::Builder::new()
             .name("sk-vitals-temp".into())
             .stack_size(256 * 1024)
-            .spawn(move || poll_loop(slot));
-        TempReader { value }
+            .spawn(move || poll_loop(slot, flag));
+        TempReader { value, enabled }
     }
 
     /// 最近一次读到的温度（摄氏度），没有数据源时为 `None`
@@ -47,6 +50,14 @@ impl TempReader {
         match self.value.load(Ordering::Relaxed) {
             NO_VALUE => None,
             v => Some(v.clamp(0, 255) as u8),
+        }
+    }
+
+    /// 关掉温度栏时停止 WMI 查询，避免无谓地拉起 WMI 服务
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.value.store(NO_VALUE, Ordering::Relaxed);
         }
     }
 }
@@ -167,12 +178,21 @@ fn build_sources() -> Vec<Source> {
     ]
 }
 
-fn poll_loop(cache: Arc<AtomicI32>) {
+fn poll_loop(cache: Arc<AtomicI32>, enabled: Arc<AtomicBool>) {
     let mut sources = build_sources();
     let mut cycle: u64 = 0;
     let mut last: Option<f64> = None;
 
     loop {
+        // 关掉温度栏时完全不查 WMI
+        if !enabled.load(Ordering::Relaxed) {
+            last = None;
+            cache.store(NO_VALUE, Ordering::Relaxed);
+            cycle += 1;
+            thread::sleep(INTERVAL);
+            continue;
+        }
+
         for src in sources.iter_mut() {
             if cycle < src.dormant_until {
                 continue;
